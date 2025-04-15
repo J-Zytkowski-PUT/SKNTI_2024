@@ -1,0 +1,208 @@
+import sys
+import numpy as np
+from scipy.signal import butter, lfilter
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout, QGridLayout, QProgressBar, QPushButton, QFileDialog
+)
+from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtCore import QTimer
+import random
+import os
+import json
+import matplotlib.pyplot as plt
+import csv
+
+# === Parametry filtru ===
+SAMPLING_FREQ = 12.8  # Hz
+CUTOFF_FREQ = 200.0  # Hz (low-pass)
+HISTORY_FILE = "rms_history.json"
+
+# === Filtr Butterwortha ===
+def butter_lowpass_filter(data, cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    y = lfilter(b, a, data)
+    return y
+
+# === Obliczanie RMS ===
+def calculate_rms(signal):
+    return np.sqrt(np.mean(np.square(signal)))
+
+# === Wczytaj historię RMS ===
+def load_rms_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+# === Zapisz historię RMS ===
+def save_rms_history(history):
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
+
+# === Wyznacz adaptacyjne progi RMS ===
+def compute_thresholds(history, name):
+    values = history.get(name, [])
+    if len(values) < 5:
+        return 0.6, 0.8  # wartości domyślne
+    mean_rms = np.mean(values)
+    std_rms = np.std(values)
+    limit = mean_rms + 2 * std_rms
+    critical = mean_rms + 3 * std_rms
+    return limit, critical
+
+# === Predykcja liczby dni do przekroczenia progów ===
+def predict_days_to_threshold(history, name, threshold):
+    values = history.get(name, [])
+    if len(values) < 5:
+        return None
+    x = np.arange(len(values))
+    y = np.array(values)
+    coeffs = np.polyfit(x, y, 1)  # regresja liniowa
+    slope = coeffs[0]
+    if slope <= 0:
+        return None
+    current_rms = values[-1]
+    days = (threshold - current_rms) / slope
+    return round(days, 1) if days > 0 else 0
+
+# === Eksport danych RMS do CSV ===
+def export_to_csv(history, filename):
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Component", "RMS Values"])
+        for component, values in history.items():
+            writer.writerow([component] + values)
+
+# === Wykresy RMS ===
+def plot_rms_trends(history):
+    for name, values in history.items():
+        if len(values) < 5:
+            continue
+        limit, critical = compute_thresholds(history, name)
+        days_to_limit = predict_days_to_threshold(history, name, limit)
+        days_to_critical = predict_days_to_threshold(history, name, critical)
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(values, label='RMS')
+        plt.axhline(limit, color='orange', linestyle='--', label=f'Limit ({days_to_limit} dni)')
+        plt.axhline(critical, color='red', linestyle='--', label=f'Krytyczny ({days_to_critical} dni)')
+        plt.title(f'RMS Trend - {name}')
+        plt.xlabel('Pomiar')
+        plt.ylabel('RMS')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+# === Widget komponentu (silnik/przekładnia) ===
+class ComponentWidget(QWidget):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        layout = QVBoxLayout()
+
+        self.label = QLabel(f"{name} RMS")
+        self.rms_display = QProgressBar()
+        self.rms_display.setRange(0, 100)
+
+        self.status_label = QLabel("Condition state")
+        self.status_light = QLabel()
+        self.status_light.setAutoFillBackground(True)
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.rms_display)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.status_light)
+
+        self.setLayout(layout)
+
+    def update_status(self, rms, limit, critical):
+        self.rms_display.setValue(int(rms * 10))
+
+        pal = self.status_light.palette()
+        if rms < limit:
+            pal.setColor(QPalette.Window, QColor('green'))
+        elif rms < critical:
+            pal.setColor(QPalette.Window, QColor('orange'))
+        else:
+            pal.setColor(QPalette.Window, QColor('red'))
+        self.status_light.setPalette(pal)
+
+# === Główne okno aplikacji ===
+class DiagnosticApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Diagnostic Dashboard")
+        self.resize(1000, 600)
+
+        layout = QGridLayout()
+
+        self.components = {}
+        self.history = load_rms_history()
+        self.session_data = {k: [] for k in [f"ENG{i+1}" for i in range(4)] + [f"PG{i+1}" for i in range(4)]}
+
+        names = list(self.session_data.keys())
+        for idx, name in enumerate(names):
+            comp = ComponentWidget(name)
+            layout.addWidget(comp, idx // 2, idx % 2)
+            self.components[name] = comp
+
+        # Przyciski funkcjonalne
+        self.plot_button = QPushButton("Pokaż wykresy RMS")
+        self.plot_button.clicked.connect(lambda: plot_rms_trends(self.history))
+        layout.addWidget(self.plot_button, 5, 0, 1, 2)
+
+        self.export_button = QPushButton("Eksportuj historię do CSV")
+        self.export_button.clicked.connect(self.export_history)
+        layout.addWidget(self.export_button, 6, 0, 1, 2)
+
+        self.setLayout(layout)
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_readings)
+        self.timer.start(1000)  # Aktualizacja co sekundę
+
+        self.reading_counter = 0
+        self.max_readings = 10  # Po ilu odczytach aktualizować historię i progi
+
+    def update_readings(self):
+        for name, widget in self.components.items():
+            raw_signal = np.array([random.uniform(0, 1.2) for _ in range(8)])
+            filtered = butter_lowpass_filter(raw_signal, CUTOFF_FREQ, SAMPLING_FREQ)
+            rms = calculate_rms(filtered)
+
+            # Zapisz do danych sesji
+            self.session_data[name].append(rms)
+
+            # Wyznacz progi adaptacyjne
+            limit, critical = compute_thresholds(self.history, name)
+            widget.update_status(rms, limit, critical)
+
+        self.reading_counter += 1
+
+        if self.reading_counter >= self.max_readings:
+            self.update_history()
+            self.reading_counter = 0
+
+    def update_history(self):
+        for name, values in self.session_data.items():
+            if name not in self.history:
+                self.history[name] = []
+            self.history[name].extend(values)
+            self.history[name] = self.history[name][-100:]
+            self.session_data[name] = []
+
+        save_rms_history(self.history)
+
+    def export_history(self):
+        filename, _ = QFileDialog.getSaveFileName(self, "Zapisz CSV", "rms_history.csv", "CSV files (*.csv)")
+        if filename:
+            export_to_csv(self.history, filename)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = DiagnosticApp()
+    window.show()
+    sys.exit(app.exec_())
